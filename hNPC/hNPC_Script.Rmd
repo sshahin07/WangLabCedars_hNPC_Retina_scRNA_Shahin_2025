@@ -1,0 +1,1315 @@
+---
+title: "hNPC_scRNAseq_analysis"
+author: "SabaShahin"
+date: "06/06/2023"
+output: html_document
+    
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+load required libraries
+```{r}
+suppressWarnings(library(dplyr))
+suppressWarnings(library(Seurat))
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(Matrix))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(cowplot))
+suppressWarnings(library(units))
+suppressWarnings(library(umap))
+suppressWarnings(library(cluster))
+suppressWarnings(library(tsne))
+suppressWarnings(library(viridis))
+suppressWarnings(library(patchwork))
+suppressWarnings(library(pmap))
+suppressWarnings(library(irlba))
+suppressWarnings(library(beepr))
+suppressWarnings(library(gridExtra))
+suppressWarnings(library(Rcpp))
+suppressWarnings(library(png))
+suppressWarnings(library(harmony))
+```
+
+# set working directory (main directory in which all data sets are present)
+# get data location in the working directory (folder that has 10X data/filtered_feature_bc_matrix data)
+
+Make sure you have all three file in the correct directory 
+
+1. matrix.mtx
+2. genes.tsv
+3. barcodes.tsv
+
+```{r}
+
+setwd("~/Desktop/invitro_invivo_hNPC_snRNAseq_data")
+dirs <- list.dirs(path = 'hNPC_scRNAseq_data', recursive = F, full.names = F)
+
+```
+
+# load data 
+# Create each individual Seurat object for every sample
+
+
+```{r}
+
+for(x in dirs){
+  name <- gsub('_filtered_feature_bc_matrix','', x)
+  
+  cts <- ReadMtx(mtx = paste0('hNPC_scRNAseq_data/',x,'/matrix.mtx.gz'),
+                 features = paste0('hNPC_scRNAseq_data/',x,'/features.tsv.gz'),
+                 cells = paste0('hNPC_scRNAseq_data/',x,'/barcodes.tsv.gz'))
+  
+  assign(name, CreateSeuratObject(counts = cts, min.cells = 3, min.features = 200))
+}
+
+```
+# check object in environment, type ls() in console
+# create new directory to save the figures
+# Set working dir 
+# save session info
+
+```{r}
+
+# check the list in console
+ls()
+setwd("~/Desktop/08-10-2023_hNPC_scRNA_seq_analysis")
+```
+
+# save session info
+
+```{r}
+sessionInfo()
+
+date <- 08-10-2023
+project <- "hNPC"
+
+sink(paste0(date,"_",project,"_devtools_sessionInfo.txt"))
+devtools::session_info()
+sink()
+
+
+sink(paste0(date,"_",project,"_sessionInfo.txt"))
+sessionInfo()
+sink()
+
+```
+
+
+# create merge seurat objects
+# merge datasets
+```{r}
+
+hNPCs_merged <- merge(invitro_hNPCsample14, y = c(invitro_hNPCsample15, invitro_hNPCsample16, invivoP60_hNPCsampleA, invivoP60_hNPCsampleB, invivoP90_hNPCsampleD),
+                      add.cell.ids = c("invitro_hNPCsample14","invitro_hNPCsample15", "invitro_hNPCsample16", "invivoP60_hNPCsampleA", "invivoP60_hNPCsampleB", "invivoP90_hNPCsampleD"),
+                      project = 'hNPCs')
+
+
+## save object
+save(hNPCs_merged, file = "hNPCs_merged.rds")
+
+# remove all objects that will not be used
+rm(invitro_hNPCsample14, invitro_hNPCsample15, invitro_hNPCsample16, invivoP60_hNPCsampleA, invivoP60_hNPCsampleB, invivoP90_hNPCsampleD)
+
+# run garbage collect to free up memory
+gc()
+
+# check no. of cells and features in merged seurat object
+hNPCs_merged
+
+# see the count matrix and the metatada for few cells
+as.data.frame(hNPCs_merged@assays$RNA@counts[1:10, 1:2])
+head(hNPCs_merged@meta.data, 10)
+tail(hNPCs_merged@meta.data, 10)
+
+```
+
+
+# create a sample column and split sample column
+```{r}
+hNPCs_merged$sample <- rownames(hNPCs_merged@meta.data)
+
+View(hNPCs_merged@meta.data)
+
+# split sample column
+
+hNPCs_merged@meta.data <- separate(hNPCs_merged@meta.data, col = 'sample', into = c('Condition',"Sample_ID",'Barcode'),
+                                   sep = '_')
+# View metadata
+View(hNPCs_merged@meta.data)
+
+# lets check the no. of cells in each conditions
+table(hNPCs_merged$Condition)
+```
+
+sanity check (whether all group are present in the data or not), type unique(hNPCs_merged_seurat@meta.data$Condition) in console
+
+# Before QC & filtering -----------------------
+
+## calculate some additional metrics for plotting:
+
+1. number of genes detected per UMI: this metric with give us an idea of the complexity of our dataset (more genes detected per UMI, more complex our data
+
+# Add number of genes per UMI for each cell to metadata
+```{r}
+hNPCs_merged$log10GenesPerUMI <- log10(hNPCs_merged$nFeature_RNA) / log10(hNPCs_merged$nCount_RNA)
+
+# View metadata
+View(hNPCs_merged@meta.data)
+```
+
+2. Check if seurat object contain mitochondrial gene and and column for mitoPercent in metadata
+```{r}
+# Check if seurat object contain mitochondrial gene
+str_subset(rownames(hNPCs_merged), "^MT")
+
+# calculate the percentage of mitochondrial reads per cell and column for mitoPercent
+hNPCs_merged$mitoPercent <- PercentageFeatureSet(hNPCs_merged, pattern = "^MT-")
+# this code also add column for mitoPercent hNPCs_merged_seurat[[percent.mt]] <- PercentageFeatureSet(hNPCs_merged_seurat, pattern = "^MT-")
+
+## View metadata
+View(hNPCs_merged@meta.data)
+```
+
+3. calculate the  proportion gene expression that comes from ribosomal proteins and add column for riboPercent in metadata
+```{r}
+
+hNPCs_merged$riboPercent <- PercentageFeatureSet(hNPCs_merged, pattern = "^RP[SL]")
+
+# View metadata
+View(hNPCs_merged@meta.data)
+```
+
+
+# Visualize QC metrics as a violin plot
+```{r}
+# plot distributions of QC metrics, grouped by SampleID with 
+pdf('ViolinPlot_before_QC_with_Points.pdf',height=6,width=12)
+VlnPlot(hNPCs_merged, features = c("nFeature_RNA", "nCount_RNA", "mitoPercent", "riboPercent"), ncol = 4, pt.size=.2, group.by='Condition')
+dev.off()
+
+
+# as a violin plot
+pdf('ViolinPlot_before_QC_no_Points.pdf', width=4, height=18)
+VlnPlot(
+  hNPCs_merged,
+  features = c("nFeature_RNA", "nCount_RNA", "mitoPercent", "riboPercent"),
+  group.by='Condition',
+  ncol = 1, pt.size=0)
+dev.off()
+
+```
+
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+```{r}
+pdf('FeatureScatterPlot_before_filtering.pdf',height=5,width=15)
+plot1 <- FeatureScatter(hNPCs_merged, feature1 = "nCount_RNA", feature2 = "mitoPercent", group.by = "Condition")
+plot2 <- FeatureScatter(hNPCs_merged, feature1 = "nCount_RNA", feature2 = "riboPercent", group.by = "Condition")
+plot3 <- FeatureScatter(hNPCs_merged, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "Condition") + geom_smooth(method = lm)
+plot1 + plot2 + plot3
+dev.off()
+```
+
+
+
+#Let’s get a sense for the size of our dataset by plotting the number of cells in each sample.
+```{r}
+theme_set(theme_cowplot())
+
+# use table function to get the number of cells in each Sample as a dataframe
+df <- as.data.frame(rev(table(hNPCs_merged$Condition)))
+colnames(df) <- c('Condition', 'n_cells')
+
+
+# bar plot of the number of cells in each sample
+p <- ggplot(df, aes(y=n_cells, x=reorder(Condition, -n_cells), fill=Condition)) +
+  geom_bar(stat='identity') +
+  scale_y_continuous(expand = c(0,0)) +
+  NoLegend() + RotatedAxis() +
+  ylab(expression(italic(N)[cells])) + xlab('Condition') +
+  ggtitle(paste('Pre_filtering:', sum(df$n_cells))) +
+  theme(
+    panel.grid.minor=element_blank(),
+    panel.grid.major.y=element_line(colour="lightgray", size=0.5),
+  )
+
+png('Total_cells_prefiltering.png', width=3, height=4, res=200, units='in')
+print(p)
+dev.off()
+
+```
+
+# Visualize the number UMIs/transcripts per cell color=Condition,
+```{r}
+# Create metadata dataframe
+metadata <- hNPCs_merged@meta.data
+
+p1 <- metadata %>% ggplot(aes(x=nCount_RNA, fill= Condition)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("cell density") +
+  geom_vline(xintercept = 500)
+
+png('nCount_per_cell.png', width=6, height=4, res=200, units='in')
+print(p1)
+dev.off()
+
+```
+
+
+# Visualize the distribution of genes detected per cell via histogram
+```{r}
+
+p2 <- metadata %>% 
+  ggplot(aes(color=Condition, x=nFeature_RNA, fill= Condition)) + 
+  geom_density(alpha = 0.2) + 
+  theme_classic() +
+  scale_x_log10() + 
+  geom_vline(xintercept = 300)
+
+png('Genes_per_cell.png', width=6, height=4, res=200, units='in')
+print(p2)
+dev.off()
+
+```
+
+# Visualize the distribution of genes detected per cell via boxplot
+
+```{r}
+p3 <- metadata %>% 
+  ggplot(aes(x=Condition, y=log10(nFeature_RNA), fill=Condition)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells vs NGenes")
+
+png('Genes_per_cell_boxplot.png', width=4, height=4, res=200, units='in')
+print(p3)
+dev.off()
+
+```
+
+## UMIs vs. genes detected
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+
+```{r}
+p4 <- metadata %>% 
+  ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=mitoPercent)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 300) +
+  facet_wrap(~Condition)
+
+png('Corellation_plot.png', width=10, height=4, res=200, units='in')
+print(p4)
+dev.off()
+
+```
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+```{r}
+p5 <- metadata %>% 
+  ggplot(aes(color=Condition, x=mitoPercent, fill=Condition)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+
+png('MitoGene_Cell.png', width=10, height=4, res=200, units='in')
+print(p5)
+dev.off()
+
+```
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+
+```{r}
+p6 <- metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, color = Condition, fill=Condition)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+
+png('GeneExpressionComplexity.png', width=6, height=4, res=200, units='in')
+print(p6)
+dev.off()
+
+```
+
+# save the merged dataset
+```{r}
+saveRDS(hNPCs_merged, file = "hNPCs_merged.rds")
+
+```
+
+# assign data to new object
+# create new directory to save the figures
+```{r}
+
+hNPCs_Filtered <- hNPCs_merged
+
+##  create new directory to save the figures
+dir.create("08102023_hNPC_Filtered")
+setwd("08102023_hNPC_Filtered")
+
+# remove unused dataset
+rm(hNPCs_merged)
+```
+
+# QC filtering -----------------------
+Final filtering, change object name as with same object name it will overwrite, object name= merged_seurat_filtered
+
+```{r}
+hNPCs_Filtered <- subset(hNPCs_Filtered, subset = nCount_RNA > 250 & nCount_RNA < 20000 & nFeature_RNA > 200 & nFeature_RNA < 5000 & mitoPercent < 20)
+
+# get the sense of no. of cells and features in filtered seurat object
+hNPCs_Filtered
+
+# lets check the no. of cells in each conditions post_filtering
+table(hNPCs_Filtered$Condition)
+
+# save the filtered object
+saveRDS(hNPCs_Filtered, file = "hNPCs_Filtered.rds")
+
+# View metadata
+View(hNPCs_Filtered@meta.data)
+```
+
+
+# Visualize post filtering QC metrics as a violin plot
+```{r}
+
+# pdf('ViolinPlot_postfitering.pdf',height=6,width=12)
+# VlnPlot(hNPCs_Filtered, features = c("nFeature_RNA", "nCount_RNA", "mitoPercent", "riboPercent"), ncol = 4, pt.size=.1)
+# dev.off()
+# 
+# pdf('ViolinPlot_withPoint_postfitering3.pdf',height=4,width=12)
+# VlnPlot(hNPCs_Filtered, features = c("nFeature_RNA", "nCount_RNA", "mitoPercent", "riboPercent"), ncol = 4, pt.size=.01, group.by = "Condition",  cols = c(invitro = "hotpink3", invivoP60 = "#abcc94", invivoP90 = "darkgoldenrod3")) + labs(y = "Your Y-axis Title")
+# dev.off()
+# 
+# pdf('ViolinPlot_post_fitering2.pdf',height=6,width=12)
+# VlnPlot(hNPCs_Filtered, features = c("nFeature_RNA", "nCount_RNA", "mitoPercent", "riboPercent"), ncol = 4, pt.size=0, group.by = "Condition")
+# dev.off()
+
+pdf('FeatureScatterPlot_postfiltering.pdf',height=5,width=18)
+plot1 <- FeatureScatter(hNPCs_Filtered, feature1 = "nCount_RNA", feature2 = "mitoPercent", group.by = "Condition")
+plot2 <- FeatureScatter(hNPCs_Filtered, feature1 = "nCount_RNA", feature2 = "riboPercent", group.by = "Condition")
+plot3 <- FeatureScatter(hNPCs_Filtered, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "Condition") + geom_smooth(method = lm)
+plot1 + plot2 + plot3
+dev.off()
+
+# Load patchwork package
+library(patchwork)
+
+# Open a PDF file to save the violin plot
+tiff('ViolinPlot_withPoint_postfitering_2.tiff',height=3.2,width=11, res=300, units='in')
+# Generate individual violin plots
+p1 <- VlnPlot(hNPCs_Filtered, features = "nFeature_RNA", pt.size = 0.001, group.by = "Condition", cols = c(invitro = "hotpink3", invivoP60 = "#abcc94", invivoP90 = "darkgoldenrod3")) + 
+  NoLegend() + 
+  ylab(expression(italic(N)[Genes]))+
+  theme(plot.title = element_blank(), axis.title.x = element_blank())
+
+p2 <- VlnPlot(hNPCs_Filtered, features = "nCount_RNA", pt.size = 0.001, group.by = "Condition", cols = c(invitro = "hotpink3", invivoP60 = "#abcc94", invivoP90 = "darkgoldenrod3")) + 
+  NoLegend()  + 
+  ylab(expression(italic(N)[UMIs])) + 
+  theme(plot.title = element_blank(), axis.title.x = element_blank())
+
+p3 <- VlnPlot(hNPCs_Filtered, features = "mitoPercent", pt.size = 0.001, group.by = "Condition", cols = c(invitro = "hotpink3", invivoP60 = "#abcc94", invivoP90 = "darkgoldenrod3")) + 
+  NoLegend() + 
+  labs(y = "Mito Percent") + 
+  theme(plot.title = element_blank(), axis.title.x = element_blank())
+
+p4 <- VlnPlot(hNPCs_Filtered, features = "riboPercent", pt.size = 0.001, group.by = "Condition", cols = c(invitro = "hotpink3", invivoP60 = "#abcc94", invivoP90 = "darkgoldenrod3")) + 
+  NoLegend() + 
+  labs(y = "Ribo Percent") + 
+  theme(plot.title = element_blank(), axis.title.x = element_blank())
+
+# Combine the plots into one with patchwork and arrange them in a grid
+(p1 | p2 | p3 | p4) + plot_layout(ncol = 4)
+
+# Close the PDF device
+dev.off()
+
+
+tiff('ViolinPlot_withPoint_postfitering_4.tiff',height=3.2,width=11, res=300, units='in')
+# Generate individual violin plots
+p1 <- VlnPlot(hNPCs_Filtered, features = "nFeature_RNA", pt.size = 0.001, group.by = "Condition") + 
+  NoLegend() + 
+  ylab(expression(italic(N)[Genes]))+
+  theme(plot.title = element_blank(), axis.title.x = element_blank())
+
+p2 <- VlnPlot(hNPCs_Filtered, features = "nCount_RNA", pt.size = 0.001, group.by = "Condition") + 
+  NoLegend()  + 
+  ylab(expression(italic(N)[UMIs])) + 
+  theme(plot.title = element_blank(), axis.title.x = element_blank())
+
+p3 <- VlnPlot(hNPCs_Filtered, features = "mitoPercent", pt.size = 0.001, group.by = "Condition") + 
+  NoLegend() + 
+  labs(y = "Mito Percent") + 
+  theme(plot.title = element_blank(), axis.title.x = element_blank())
+
+p4 <- VlnPlot(hNPCs_Filtered, features = "riboPercent", pt.size = 0.001, group.by = "Condition") + 
+  NoLegend() + 
+  labs(y = "Ribo Percent") + 
+  theme(plot.title = element_blank(), axis.title.x = element_blank())
+
+# Combine the plots into one with patchwork and arrange them in a grid
+(p1 | p2 | p3 | p4) + plot_layout(ncol = 4)
+
+# Close the PDF device
+dev.off()
+
+```
+
+# use table function to get the number of cells in each Sample as a dataframe
+
+```{r}
+
+df <- as.data.frame(rev(table(hNPCs_Filtered$Condition)))
+colnames(df) <- c('Condition', 'n_cells')
+
+# Define custom colors for each condition
+cols <- c(invitro = "hotpink3", invivoP60 = "#abcc94", invivoP90 = "darkgoldenrod3")
+
+# bar plot of the number of cells in each sample
+p7 <- ggplot(df, aes(y=n_cells, x=reorder(Condition, -n_cells), fill=Condition)) +
+  geom_bar(stat='identity') +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_manual(values = cols) +  
+  NoLegend() + RotatedAxis() +
+  ylab(expression(italic(N)[cells])) + xlab('Condition') +
+  ggtitle(paste('Post Filter:', sum(df$n_cells))) +
+  theme(
+    panel.grid.minor=element_blank(),
+    panel.grid.major.y=element_line(colour="lightgray", size=0.5),
+  )
+
+png('Total_cells_postfiltering.png', width=3, height=4, res=200, units='in')
+print(p7)
+dev.off()
+
+```
+
+# Create metadata dataframe
+Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+
+```{r}
+View(hNPCs_Filtered@meta.data)
+metadata_F <- hNPCs_Filtered@meta.data
+
+p8 <- metadata_F %>% 
+  ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=mitoPercent)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 300) +
+  facet_wrap(~Condition)
+
+png('PostFilter_Corellation_plot.png', width=10, height=4, res=200, units='in')
+print(p8)
+dev.off()
+
+# # save filtered object
+saveRDS(hNPCs_Filtered, file = "hNPCs_Filtered.rds")
+```
+
+#
+# load and assign data to new object
+```{r}
+
+hNPCs_Filtered <- readRDS("~/Desktop/08-10-2023_hNPC_scRNA_seq_analysis/08102023_hNPC_Filtered/hNPCs_Filtered.rds")
+
+table(hNPCs_Filtered$Sample_ID)
+# assign data to new object
+hNPCs_Scaled <- hNPCs_Filtered
+```
+
+##  create new directory to save the figures
+```{r}
+
+dir.create("10042023_hNPC_Scale_data")
+setwd("10042023_hNPC_Scale_data")
+
+```
+
+# Check whether data have batch effect or not? 
+
+# 1. Normalize data ----------
+```{r}
+hNPCs_Scaled <- NormalizeData(hNPCs_Filtered, normalization.method = "LogNormalize", scale.factor = 10000)
+
+```
+
+
+# 2. Identify and plot highly variable features --------------
+```{r}
+
+hNPCs_Scaled <- FindVariableFeatures(hNPCs_Scaled, selection.method = "vst", nfeatures = 3000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(hNPCs_Scaled), 10)
+
+# plot variable features with and without labels
+pdf('VariableFeatures.pdf', height=4,width=12)
+plot1 <- VariableFeaturePlot(hNPCs_Scaled)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = T)
+plot1 + plot2
+dev.off()
+
+str(hNPCs_Scaled)
+```
+
+# 3. Scale the data -------------
+```{r}
+all.genes <- rownames(hNPCs_Scaled)
+hNPCs_Scaled <- ScaleData(hNPCs_Scaled, features = all.genes)
+saveRDS(hNPCs_Scaled, "hNPCs_Scaled.rds")
+```
+
+
+# 4. Run PCA
+```{r}
+hNPCs_Scaled_PCA <- RunPCA(hNPCs_Scaled, features = VariableFeatures(object = hNPCs_Scaled))
+
+# visualize PCA results
+print(hNPCs_Scaled_PCA[["pca"]], dims = 1:5, nfeatures = 5)
+
+# plot the top genes contributing to the first 3 PCs
+plot4 <- VizDimLoadings(hNPCs_Scaled_PCA, dims = 1:6, reduction = "pca", ncol = 3)
+png('PCA_VizDimLoadings.png', height=12, width=10, res = 200, units = 'in')
+print(plot4)
+dev.off()
+
+# PCA scatter plot colored by sampleID
+
+plot5 <- DimPlot(hNPCs_Scaled_PCA, reduction = "pca", group.by = 'Condition')
+png('PCA_ScatterPlot.png', height=6, width=7, res = 200, units = 'in')
+print(plot5)
+dev.off()
+
+# Determine dimensionality of the data i.e standard deviation of each PCA in a Elbow plot
+png('PCA_ElbowPlot.png',height=3,width=6, res = 200, units = 'in')
+ElbowPlot(hNPCs_Scaled_PCA, ndims = 50)
+dev.off()
+
+# plot pca map
+png('PCA_map.png', width=10, height=10, res=300, units='in')
+DoHeatmap(hNPCs_Scaled_PCA, dims = 1:15, cells = 500, balanced = TRUE)
+dev.off()
+
+### save the data as RDS file
+saveRDS(hNPCs_Scaled_PCA, file = "hNPCs_Scaled_PCA.rds")
+```
+
+
+# perform non-linear dimensionality reduction for visualization--------------
+```{r}
+
+hNPCs_rat_UMAP <- FindNeighbors(object = hNPCs_Scaled_PCA, dims = 1:30)
+hNPCs_rat_UMAP <- FindClusters(object = hNPCs_rat_UMAP, resolution = c(0.1, 0.2, 0.3, 0.4, 0.5))
+hNPCs_rat_UMAP <- RunUMAP(object = hNPCs_rat_UMAP, dims = 1:30)
+hNPCs_rat_UMAP <- RunTSNE(object = hNPCs_rat_UMAP, dims = 1:30)
+
+# View metadata
+View(hNPCs_rat_UMAP@meta.data)
+```
+
+# create new directory to save the figures
+```{r}
+Idents(hNPCs_rat_UMAP) <- "RNA_snn_res.0.1"
+png('UMAP_tSNE_Plots.png',height=6,width=8, res = 200, units = 'in')
+DimPlot(object = hNPCs_rat_UMAP, reduction = "tsne",label=TRUE)
+DimPlot(hNPCs_rat_UMAP, reduction = "umap",label=TRUE)
+dev.off()
+
+png('UMAP_Plot.png',height=6,width=7, res = 200, units = 'in')
+DimPlot(hNPCs_rat_UMAP, reduction = "umap", label = T)
+dev.off()
+
+png('UMAP_Plot_grouped.png',height=6,width=7, res = 200, units = 'in')
+DimPlot(hNPCs_rat_UMAP, reduction = "umap", group.by = "Condition", label = T)
+dev.off()
+
+png('UMAP_Plots_split_group.png',height=4,width=10, res = 200, units = 'in')
+DimPlot(hNPCs_rat_UMAP, reduction = "umap", split.by = "Condition", label = T)
+dev.off()
+
+saveRDS(hNPCs_rat_UMAP, file = "hNPCs_rat_UMAP.rds")
+
+```
+
+# Batch correction:
+
+```{r}
+dir.create("Batch_correction")
+setwd("Batch_correction")
+
+```
+
+
+# Integrate the data by CCA____________________
+1. set working directory
+2. load the data
+```{r}
+
+hNPCs_rat_integ <- readRDS("~/Desktop/08-10-2023_hNPC_scRNA_seq_analysis/08102023_hNPC_Filtered/hNPCs_Filtered.rds")
+
+# View metadata
+View(hNPCs_rat_integ@meta.data)
+
+rm(hNPCs_rat_UMAP, metadata, metadata_F)
+```
+
+# split the dataset into a list of seurat objects (invitro, invivoP60, invivoP90)
+```{r}
+hNPCs_rat_list <- SplitObject(hNPCs_Filtered, split.by = "Condition")
+
+```
+
+
+# normalize and identify variable features for each dataset independently
+```{r}
+hNPCs_rat_list <- lapply(X = hNPCs_rat_list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 3000)
+})
+
+```
+
+# Perform integration______________
+1. select features that are repeatedly variable across datasets for integration
+
+```{r}
+features <- SelectIntegrationFeatures(object.list = hNPCs_rat_list)
+
+```
+
+2. Find integration anchor
+```{r}
+hNPCs_rat_anchors <- FindIntegrationAnchors(object.list = hNPCs_rat_list, anchor.features = features)
+
+```
+
+3. creates an 'integrated' data assay
+```{r}
+
+hNPC_rat_combined <- IntegrateData(anchorset = hNPCs_rat_anchors)
+
+```
+
+
+# Save integrated seurat object 
+```{r}
+
+saveRDS(hNPC_rat_combined, file="hNPC_rat_integ_CCA.rds")
+
+# remove objects that are not required
+rm(hNPCs_rat_anchors, hNPCs_rat_list, hNPCs_Scaled, hNPCs_Scaled_PCA)
+
+```
+
+
+## Perform downstream analysis on the corrected data note that the original unmodified data still resides in the 'RNA' assay, set Defult assay  "integrated"
+
+```{r}
+DefaultAssay(hNPC_rat_combined) <- "integrated"
+```
+
+# Scale the data and PCA
+```{r}
+hNPC_rat_combined <- ScaleData(hNPC_rat_combined, verbose = FALSE)
+hNPC_rat_combined <- RunPCA(hNPC_rat_combined, npcs = 30, verbose = FALSE)
+```
+
+# Plot PCA
+```{r}
+png('PCA_ScatterPlot.png', height=3, width=7, res = 200, units = 'in')
+PCAPlot(hNPC_rat_combined,
+        split.by = "Condition")  
+dev.off()
+
+png('PCA_ElbowPlot_Batch.png',height=3,width=6, res = 200, units = 'in')
+ElbowPlot(hNPC_rat_combined, ndims = 30)
+dev.off()
+
+png('PCA_Heatmap_Batch.png', width=10, height=10, res=300, units='in')
+DoHeatmap(hNPC_rat_combined, dims = 1:15, cells = 500, balanced = TRUE)
+dev.off()
+
+```
+
+# Run the standard workflow for visualization and clustering
+```{r}
+
+hNPC_rat_combined <- FindNeighbors(hNPC_rat_combined, reduction = "pca", dims = 1:30)
+hNPC_rat_combined <- FindClusters(hNPC_rat_combined, resolution =  c(0.1, 0.2, 0.3, 0.4, 0.5))
+hNPC_rat_combined <- RunUMAP(hNPC_rat_combined, reduction = "pca", dims = 1:30)
+hNPC_rat_combined <- RunTSNE(object = hNPC_rat_combined, reduction = "pca", dims = 1:30)
+
+# View metadata
+View(hNPC_rat_combined@meta.data)
+```
+
+
+# Assign identity of clusters
+```{r}
+
+Idents(object = hNPC_rat_combined) <- "integrated_snn_res.0.5"
+
+#check number of cells in each cluster
+table(Idents(hNPC_rat_combined))
+```
+
+
+# save figure in new directory
+```{r}
+
+dir.create('integ_data_fig')
+setwd("integ_data_fig")
+
+```
+
+
+#check the Umap plot after CCA Batch Correction
+```{r}
+
+umap_theme <- theme(
+  axis.line = element_line(),
+  axis.text.x = element_text(size = 12),
+  axis.text.y = element_text(size = 12),
+  axis.ticks = element_line(),
+  axis.title.x = element_text(size = 12),
+  axis.title.y = element_text(size = 12),
+  panel.background = element_blank(),
+  panel.border = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  plot.background = element_blank(),
+  plot.title = element_text(size = 12)
+)
+
+png('hNPC_rat_umap_tsne_grouped.png', height=4, width=10, res = 300, units = 'in')
+p10 <- DimPlot(hNPC_rat_combined, reduction = "tsne", group.by = "Condition", pt.size = 0.1)
+p11 <- DimPlot(hNPC_rat_combined, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.1) + umap_theme
+p10 + p11
+dev.off()
+
+
+png('CCA_umap_splitted.png', height=4, width=10, res = 200, units = 'in')
+DimPlot(hNPC_rat_combined, reduction = 'umap', split.by = "Condition", label = T) + NoLegend()
+dev.off()
+
+
+png('CCA_umap_grouped.png', height=5, width=6, res = 200, units = 'in')
+DimPlot(hNPC_rat_combined, reduction = 'umap', group.by = "Condition", label = T) 
+dev.off()
+
+```
+
+
+# Save integrated seurat object 
+```{r}
+
+saveRDS(hNPC_rat_combined, file="hNPC_rat_combined_UMAP.rds")
+
+```
+
+
+# identify clusters on the basis of markers genes
+```{r}
+genes=c("HLA-DMA", "HLA-DR","HLA-G", "HLA-C", "HLA-A", "HLA-B","HLA-E","HLA-DRB1", "HLA-DRA", "HLA-F","TMEM119", "CX3CR1", 'P2RY12', "CSF1R", "CD99", "TYROBP","ITGAM","NES", "SOX2", "CD44", "HOPX", "SOX9", "S100B", "VIM", "GFAP", "AQP4", "SLC1A2", "SLC1A3", "OLIG1", "OLIG2", "MOBP", "MBP", "MOG", "PDFGRA", "CSPG4","GAD2", "MAP2", "SNAP25", "SYT1", "PLP1", "PLP4", "GRM6", "PMP2", "DTNA", "RHO", "RCVRN", "GNAT1","ROM1", "ARR","GNAT2",  "OPN1SW", "RBPMS", "RLBP1","GLUL", "VSX2", "VSX1","GNK1","GSG1","SNGC", "GNGT2", "CALB1", "CAPN14", "SCA1", "CD117", "CD45RA", "CD14", "CD68", "CD163", "CD45", "MANF", "CDNF","GDNF", "BDNF", "NFE2L2", "FGF1", "FGF2", "MYDGF","IGF", "MANFR", "ERN1","KDELR1" ,"KDELR2", "NTRK1", "NTRK2")
+
+
+png('MarkerGenes_Plots.png', height=150,width=10, res = 200, units = 'in')
+FeaturePlot(hNPC_rat_combined, features = genes, max.cutoff = 98, min.cutoff = "q10", split.by = "Condition", cols = viridis(256), pt.size = 0.8, reduction = "umap") & umap_theme
+dev.off()
+
+
+png('VlnMarkerGenes_Plots.png', height=70,width=30, res = 200, units = 'in')
+VlnPlot(hNPC_rat_combined, features = genes, pt.size=0)
+dev.off()
+
+```
+
+# Plot heatmap (assay = integrated)
+```{r}
+
+png('Markergenes_map_integ.png', width=10, height=10, res=300, units='in')
+DoHeatmap(hNPC_rat_combined, features = genes, assay = "integrated") + NoLegend()
+dev.off()
+
+png('Markergenes_map_integ_Vir.png', width=10, height=10, res=300, units='in')
+DoHeatmap(hNPC_rat_combined, features = genes, assay = "integrated" , size = 5.5) + NoLegend() + scale_fill_gradientn(colors=viridis(256)) 
+dev.off()
+```
+
+# Plot heatmap (assay=RNA)
+```{r}
+
+png('Markergenes_map_RNA.png', width=10, height=10, res=300, units='in')
+DoHeatmap(hNPC_rat_combined, features = genes, assay = "RNA") + NoLegend()
+dev.off()
+
+```
+
+
+# Find conserved marker for 1, 3 and 12 clusters
+```{r}
+## set DefaultAssay to RNA
+DefaultAssay(hNPC_rat_combined) <- "RNA"
+
+## C1
+C1.markers <- FindConservedMarkers(hNPC_rat_combined, ident.1 = 1, grouping.var = "Condition", verbose = FALSE)
+head(C1.markers, 15)
+
+## load annotation file
+annotations <- read.csv("annotations.csv")
+
+# Turn the DESeq2 results object into a tibble for use with tidyverse functions
+
+C1.markers <- C1.markers %>%
+  data.frame() %>%
+  rownames_to_column(var = "gene") %>% 
+                left_join(y = unique(annotations[, c("gene_name", "description")]),
+                          by = c("gene" = "gene_name")) %>%
+  as_tibble() 
+
+# Write all results to file
+write.csv(C1.markers,"C1_ConservedMarkers.csv", quote = FALSE, row.names = FALSE)
+
+## C3
+C3.markers <- FindConservedMarkers(hNPC_rat_combined, ident.1 = 3, grouping.var = "Condition", verbose = FALSE)
+head(C3.markers, 15)
+
+C3.markers <- C3.markers %>%
+  data.frame() %>%
+  rownames_to_column(var = "gene") %>% 
+                left_join(y = unique(annotations[, c("gene_name", "description")]),
+                          by = c("gene" = "gene_name")) %>%
+  as_tibble() 
+
+# Write all results to file
+write.csv(C3.markers,"C3_ConservedMarkers.csv", quote = FALSE, row.names = FALSE)
+
+## C12
+C12.markers <- FindConservedMarkers(hNPC_rat_combined, ident.1 = 12, grouping.var = "Condition", verbose = FALSE)
+head(C12.markers, 15)
+C12.markers <- C12.markers %>%
+  data.frame() %>%
+  rownames_to_column(var = "gene") %>% 
+                left_join(y = unique(annotations[, c("gene_name", "description")]),
+                          by = c("gene" = "gene_name")) %>%
+  as_tibble() 
+
+# Write all results to file
+write.csv(C12.markers,"C12_ConservedMarkers.csv", quote = FALSE, row.names = FALSE)
+
+
+```
+
+# Rename suerat cluster__________
+```{r}
+cluster_annotations <- list(
+  '0' = 'hNPC',
+  '1' = 'Microglia1',
+  '2' = 'Bipolar1',
+  '3' = 'Microglia2',
+  '4' = 'hNPC',
+  '5' = 'Müller glia',
+  '6' = 'RGC1', 
+  '7' = 'hNPC',
+  '8' = 'hNPC',
+  '9' = 'Bipolar2',
+  '10' = 'PR',
+  '11' = 'RGC2',
+  '12' = 'Microglia3'
+  )
+```
+
+
+# Add CellType to seurat metadata__________
+```{r}
+
+hNPC_rat_combined$CellType <- unlist(cluster_annotations[hNPC_rat_combined$integrated_snn_res.0.1])
+hNPC_rat_combined$CellType_cluster <- paste0(hNPC_rat_combined$CellType, '-', hNPC_rat_combined$integrated_snn_res.0.1)
+
+# Check the metadata for renamed cluster 
+View(hNPC_rat_combined@meta.data)
+
+
+```
+
+# Plot UMAP for integrated dataset__________
+```{r}
+
+umap_theme1 <- theme(
+  axis.line = element_line(),
+  axis.text.x = element_text(size = 15),
+  axis.text.y = element_text(size = 15),
+  axis.ticks = element_line(),
+  axis.title.x = element_text(size = 15),
+  axis.title.y = element_text(size = 15),
+  panel.background = element_blank(),
+  panel.border = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  plot.background = element_blank(),
+  plot.title = element_text(size = 15)
+)
+
+png('umap_celltypes_grouped.png', width=8, height=7, res=200, units='in')
+DimPlot(hNPC_rat_combined, label = TRUE, group.by = "CellType") & umap_theme1
+dev.off()
+
+```
+
+# Plot map (assay = integrated)
+```{r}
+
+genes=c("HLA-A", "HLA-B","HLA-C","NES", "SOX2", "PLP1", "PLP4", "GRM6", "PMP2", "DTNA","VIM", "CD44", "HOPX", "SOX9", "S100B","GFAP", "AQP4", "SLC1A2", "EGFR","PDFGRA","CSPG4", "OLIG1", "OLIG2", "MOBP", "MBP", "MOG", "CXCR4", "MAP2", "GAD2","SNAP25", "SYT1",  "RHO", "RCVRN", "GNAT1","ROM1", "ARR","GNAT2",  "OPN1SW", "RBPMS", "RLBP1","GLUL","VSX1", "VSX2", "GNK1","GSG1","SNGC", "GNGT2", "CALB1", "CAPN14", "SCA1", "CD117", "CD45RA", "CD14", "CD68", "CD163", "CD45", "CX3CR1",  "CSF1R","TYROBP")
+
+png('Markergenes_map_integ.png', width=10, height=10, res=300, units='in')
+DoHeatmap(hNPC_rat_combined, features = genes, assay = "integrated", group.by = "integrated_snn_res.0.1") + NoLegend()
+dev.off()
+
+png('Markergenes_map_integ_Vir.png', width=10, height=10, res=300, units='in')
+DoHeatmap(hNPC_rat_combined, features = genes, assay = "integrated" , size = 5.5) + NoLegend() + scale_fill_gradientn(colors=viridis(256)) 
+dev.off()
+
+png('Markergenes_map_integ.png', width=10, height=10, res=300, units='in')
+DotPlot(hNPC_rat_combined, features = genes, assay = "integrated", group.by = "integrated_snn_res.0.1") + NoLegend()
+dev.off()
+
+png('Dotplot_Markergenes_integ.png', width=18, height=5, res=300, units='in')
+DotPlot(hNPC_rat_combined, features = genes, assay = "RNA") + RotatedAxis()
+dev.off()
+
+png('Dotplot_Markergenes_integ1.png', width=18, height=5, res=300, units='in')
+DotPlot(hNPC_rat_combined, features = genes, assay = "RNA", group.by = "CellType") + RotatedAxis()
+dev.off()
+
+# Save the object
+saveRDS(hNPC_rat_combined, file="hNPC_rat_combined_clusterID.rds")
+```
+
+# Subset the hNPC Cluster________
+# set directories__________
+```{r}
+
+dir.create('subset_hNPC_cluster')
+setwd('subset_hNPC_cluster')
+
+```
+
+
+# change DefaultAssay and Idents__________
+```{r}
+
+DefaultAssay(hNPC_rat_combined) <- "RNA"
+Idents(hNPC_rat_combined) <- "CellType"
+
+```
+
+# Plot UMAP for integrated dataset__________
+```{r}
+png('umap_celltypes_grouped1.png', width=8, height=7, res=200, units='in')
+DimPlot(hNPC_rat_combined, label = TRUE) & umap_theme1
+dev.off()
+
+```
+
+# subset hNPC_Cluster
+```{r}
+
+hNPC_cluster <- subset(hNPC_rat_combined, idents = "hNPC")
+rm(hNPC_rat_combined)
+
+# Save the object as RDS file
+saveRDS(hNPC_cluster, file = "subset_hNPCs_Cluster.rds")
+
+```
+
+# visualization
+```{r}
+
+pdf('ViolinPlot_withPoint.pdf', height=3.5,width=10)
+VlnPlot(hNPC_cluster, features = c("nFeature_RNA", "nCount_RNA", "mitoPercent", "riboPercent"), ncol = 4, pt.size=.2, group.by = "Condition")
+dev.off()
+
+png('hNPC_UMAP_grouped.png', height=5,width=6, res=200, units='in')
+DimPlot(hNPC_cluster, reduction = 'umap', group.by = 'Condition')
+dev.off()
+
+png('hNPC_UMAP_Splitted.png', height=5,width=12, res=200, units='in')
+DimPlot(hNPC_cluster, reduction = 'umap', pt.size = 0.5 , split.by = 'Condition')
+dev.off()
+
+```
+
+
+# check the total no. of features and cells in hNPCs cluster or different condition
+```{r}
+hNPC_cluster
+table(hNPC_cluster$Condition)
+```
+
+# Extract number of cells per cluster per orig.ident 
+```{r}
+
+n_cells <- FetchData(hNPC_cluster, vars = c("ident", "Condition")) %>%
+  dplyr::count(ident, Condition) %>%
+  tidyr::spread(ident, n)
+
+# save the cell no. in CSV file
+write.csv(n_cells, file = "Cells_per_cluster.csv")
+
+n_cells
+
+rm(n_cells)
+
+```
+
+
+# Perform integration and following steps again on subset hNPC cluster_____
+
+1. Split the dataset into a list of seurat objects (invitro, invivoP60, invivoP90)
+```{r}
+
+hNPC.list <- SplitObject(hNPC_cluster, split.by = "Condition")
+
+```
+
+
+# Normalize and identify variable features for each dataset independently__________
+```{r}
+hNPC.list <- lapply(X = hNPC.list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 3000)
+})
+```
+
+
+# Perform integration______________
+# select features that are repeatedly variable across datasets for integration
+```{r}
+
+features <- SelectIntegrationFeatures(object.list = hNPC.list)
+
+```
+
+
+# Find integration anchor
+```{r}
+hNPC.anchors <- FindIntegrationAnchors(object.list = hNPC.list, anchor.features = features)
+
+```
+
+# creates an 'integrated' data assay
+```{r}
+
+hNPC_integ <- IntegrateData(anchorset = hNPC.anchors)
+
+# save object
+saveRDS(hNPC_integ, "hNPC_integ.rds")
+
+```
+
+
+# Scale the data and run PCA_________
+```{r}
+## set default assay to integrated
+DefaultAssay(hNPC_integ) <- "integrated"
+hNPC_integ <- ScaleData(hNPC_integ, verbose = FALSE)
+hNPC_integ <- RunPCA(hNPC_integ, npcs = 30, verbose = FALSE)
+
+```
+
+
+# save figure in new directory
+```{r}
+
+dir.create('hNPC_integ_data_fig')
+setwd("hNPC_integ_data_fig")
+
+```
+
+
+# Visualize the PCA plot
+```{r}
+
+png('PCA_map.png',height=10,width=10, res = 200, units = 'in')
+DoHeatmap(hNPC_integ, dims = 1:15, cells = 500, balanced = TRUE)
+dev.off()
+
+
+# PCA scatter plot colored by sampleID
+png('PCA_ScatterPlot.png', height=6, width=7, res = 200, units = 'in')
+DimPlot(hNPC_integ, reduction = "pca", group.by = 'Condition')
+dev.off()
+
+
+
+png('PCA_ElbowPlot.png', height=3, width=6, res = 200, units = 'in')
+ElbowPlot(hNPC_integ)
+dev.off()
+
+```
+
+
+# Run the standard workflow for clustering_________
+```{r}
+hNPC_integ <- FindNeighbors(hNPC_integ, reduction = "pca", dims = 1:20)
+hNPC_integ <- FindClusters(hNPC_integ, resolution =  c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9))
+hNPC_integ <- RunUMAP(hNPC_integ, reduction = "pca", dims = 1:20)
+hNPC_integ <- RunTSNE(hNPC_integ, reduction = "pca", dims = 1:20)
+
+
+View(hNPC_integ@meta.data)
+```
+
+# check the Umap plot after CCA Batch Correction
+```{r}
+
+View(hNPC_integ@meta.data)
+
+Idents(hNPC_integ) <- "integrated_snn_res.0.4"
+pdf('hNPC_umap_tsne_integrated_snn_res.0.4.pdf',height=4,width=10)
+p14 <- DimPlot(hNPC_integ, reduction = "tsne", group.by = "Condition", pt.size = 0.8)
+p15 <- DimPlot(hNPC_integ, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.8)
+p14 + p15
+dev.off()
+
+
+Idents(hNPC_integ) <- "integrated_snn_res.0.5"
+pdf('hNPC_umap_tsne_integrated_snn_res.0.5.pdf',height=4,width=10)
+p14 <- DimPlot(hNPC_integ, reduction = "tsne", group.by = "Condition", pt.size = 0.8)
+p15 <- DimPlot(hNPC_integ, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.8)
+p14 + p15
+dev.off()
+
+Idents(hNPC_combined) <- "integrated_snn_res.0.6"
+pdf('hNPC_umap_tsne_integrated_snn_res.0.6.pdf',height=4,width=10)
+p14 <- DimPlot(hNPC_integ, reduction = "tsne", group.by = "Condition", pt.size = 0.8)
+p15 <- DimPlot(hNPC_integ, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.8)
+p14 + p15
+dev.off()
+
+Idents(hNPC_combined) <- "integrated_snn_res.0.7"
+pdf('hNPC_umap_tsne_integrated_snn_res.0.7.pdf',height=4,width=10)
+p14 <- DimPlot(hNPC_integ, reduction = "tsne", group.by = "Condition", pt.size = 0.8)
+p15 <- DimPlot(hNPC_integ, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.8)
+p14 + p15
+dev.off()
+
+Idents(hNPC_integ) <- "integrated_snn_res.0.8"
+pdf('hNPC_umap_tsne_integrated_snn_res.0.8.pdf',height=4,width=10)
+p14 <- DimPlot(hNPC_integ, reduction = "tsne", group.by = "Condition", pt.size = 0.8)
+p15 <- DimPlot(hNPC_integ, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.8)
+p14 + p15
+dev.off()
+
+
+Idents(hNPC_integ) <- "integrated_snn_res.0.9"
+pdf('hNPC_umap_tsne_integrated_snn_res.0.9.pdf',height=4,width=10)
+p14 <- DimPlot(hNPC_integ, reduction = "tsne", group.by = "Condition", pt.size = 0.8)
+p15 <- DimPlot(hNPC_integ, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.8)
+p14 + p15
+dev.off()
+
+```
+
+# Marker gene
+```{r}
+genes=c("NES", "SOX2", "CD44", "GLAST","VIM", "PAX6", "CXCR4", "NEUROD1","MAP2", "NEUN", 'SNAP25', "SYT1", "EGFR", 'PDGFRA', 'CSPG4', "OLIG1", "OLIG2", "MBP", "MOG","MOBP","HES5","SOX9", "HOPX", "PAX3", "GFAP","S100B", "AQP4", "GLUL", "SLC1A2", "CD24", "THY1")
+
+png('Markergenes_heatmap_assay_int.png', width=6, height=8, res=300, units='in')
+DoHeatmap(object = hNPC_integ, features = genes, assay = "integrated", label = F,
+  size = 5.5) + theme(axis.text.y = element_text(size = 10))
+dev.off()
+
+png('Markergenes_heatmap_assay_RNA.png', width=6, height=8, res=300, units='in')
+DoHeatmap(object = hNPC_integ, features = genes, assay = "RNA", label = F,
+  size = 5.5) + theme(axis.text.y = element_text(size = 10))
+dev.off()
+
+
+# visualize
+png('hNPC_umap_splitted2.png',height=4,width=10, res=300, units='in')
+DimPlot(hNPC_integ, reduction = 'umap', split.by = "Condition", label = T, pt.size = 0.8) + NoLegend()
+dev.off()
+
+png('hNPC_umap_grouped3.png',height=5,width=6, res=300, units='in')
+DimPlot(hNPC_integ, reduction = 'umap', group.by = "Condition", label = T, pt.size = 0.5) 
+dev.off()
+
+
+```
+
+# umap
+```{r}
+umap_theme <- theme(
+  axis.line = element_line(),
+  axis.text.x = element_text(size = 15),
+  axis.text.y = element_text(size = 15),
+  axis.ticks = element_line(),
+  axis.title.x = element_text(size = 15),
+  axis.title.y = element_text(size = 15),
+  panel.background = element_blank(),
+  panel.border = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  plot.background = element_blank(),
+  plot.title = element_text(size = 15)
+)
+
+
+Idents(hNPC_integ) <- "integrated_snn_res.0.6"
+png('hNPC_umap_tsne_grouped.png', height=4, width=10, res = 300, units = 'in')
+p21 <- DimPlot(hNPC_integ, reduction = "tsne", group.by = "Condition", pt.size = 0.5)
+p22 <- DimPlot(hNPC_integ, reduction = "umap", label = TRUE, repel = TRUE, pt.size = 0.5) + umap_theme
+p21 + p22
+dev.off()
+
+```
+
+# check number of cells in each cluster (integrated_snn_res.0.6)
+```{r}
+
+table(hNPC_integ$integrated_snn_res.0.6)
+
+# save data in csv file
+n_cells <- FetchData(hNPC_integ, vars = c("ident", "Condition")) %>%
+  dplyr::count(ident, Condition) %>%
+  tidyr::spread(ident, n)
+
+n_cells1
+
+write.csv(n_cells, file = "Cells_per_cluster_integrated_snn_res.0.6.csv")
+
+rm(n_cells)
+
+```
+
+# save RDS
+```{r}
+saveRDS(hNPC_integ, "hNPC_integ_Cluster.rds")
+```
+
