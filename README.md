@@ -1,4 +1,4 @@
-# Dynamic Transcriptomic Remodeling in Grafted Human Neural Progenitor Cells Uncovers Mechanisms for Vision Preservation in Retinitis Pigmentosa
+# Dynamic Transcriptomic Remodeling in Grafted Human Neural Progenitor Cells Uncovers Mechanisms for Vision Preservation in a rat model of Retinitis Pigmentosa
 
 ** Shahin et al. 2025 **
 
